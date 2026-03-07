@@ -1,0 +1,227 @@
+module smtp;
+
+
+// ---------------------------------------------------------------------------
+// SMTP Client Library for Novus/Nox
+// Implements basic SMTP protocol over TCP for sending emails.
+// Supports: EHLO, AUTH LOGIN (Base64), MAIL FROM, RCPT TO, DATA
+//
+// Note: SMTP_HOST must be an IP address (e.g. "192.168.1.1"), not a hostname.
+// Use four separate octet integers for the connection.
+// ---------------------------------------------------------------------------
+
+// Base64 encoding table
+let b64_chars: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(input: str) -> str {
+    let result: str = "";
+    let i: i32 = 0;
+    let input_len: i32 = len(input);
+
+    while (i < input_len) {
+        let b0: i32 = byte_at(input, i);
+        let b1: i32 = 0;
+        let b2: i32 = 0;
+        let pad: i32 = 0;
+
+        if (i + 1 < input_len) {
+            b1 = byte_at(input, i + 1);
+        } else {
+            pad = pad + 1;
+        }
+        if (i + 2 < input_len) {
+            b2 = byte_at(input, i + 2);
+        } else {
+            pad = pad + 1;
+        }
+
+        let idx0: i32 = b0 / 4;
+        let idx1: i32 = ((b0 % 4) * 16) + (b1 / 16);
+        let idx2: i32 = ((b1 % 16) * 4) + (b2 / 64);
+        let idx3: i32 = b2 % 64;
+
+        result = result + substr_len(b64_chars, idx0, 1);
+        result = result + substr_len(b64_chars, idx1, 1);
+
+        if (pad >= 2) {
+            result = result + "=";
+        } else {
+            result = result + substr_len(b64_chars, idx2, 1);
+        }
+
+        if (pad >= 1) {
+            result = result + "=";
+        } else {
+            result = result + substr_len(b64_chars, idx3, 1);
+        }
+
+        i = i + 3;
+    }
+
+    return result;
+}
+
+// Parse IP string "a.b.c.d" into individual octets
+fn parse_ip_octet(ip: str, index: i32) -> i32 {
+    let parts_found: i32 = 0;
+    let current: str = "";
+    let i: i32 = 0;
+    while (i < len(ip)) {
+        let ch: i32 = byte_at(ip, i);
+        if (ch == 46) { // '.'
+            if (parts_found == index) {
+                return str_to_i32(current);
+            }
+            parts_found = parts_found + 1;
+            current = "";
+        } else {
+            current = current + substr_len(ip, i, 1);
+        }
+        i = i + 1;
+    }
+    if (parts_found == index) {
+        return str_to_i32(current);
+    }
+    return 0;
+}
+
+// Read SMTP response from server
+fn smtp_read_response(fd: i32) -> str {
+    let buf: str = make_buffer(4096);
+    let n: i32 = net_read(fd, buf, 4096);
+    if (n <= 0) { return ""; }
+    return substr_len(buf, 0, n);
+}
+
+// Get the 3-digit response code from an SMTP response
+fn smtp_response_code(response: str) -> i32 {
+    if (len(response) < 3) { return 0; }
+    let code_str: str = substr_len(response, 0, 3);
+    return str_to_i32(code_str);
+}
+
+// Send a line to the SMTP server (appends CRLF)
+fn smtp_send_line(fd: i32, line: str) -> void {
+    net_write_str(fd, line + "\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// Connect to SMTP server and send an email
+// host: IP address string (e.g. "10.0.0.1")
+// Returns true on success, false on failure
+// ---------------------------------------------------------------------------
+fn smtp_send_email(host: str, port: i32, username: str, password: str, from_email: str, to_email: str, subject: str, body: str) -> bool {
+    // Parse IP address
+    let a: i32 = parse_ip_octet(host, 0);
+    let b: i32 = parse_ip_octet(host, 1);
+    let c: i32 = parse_ip_octet(host, 2);
+    let d: i32 = parse_ip_octet(host, 3);
+
+    // Create socket and connect
+    let sock: i32 = net_socket();
+    if (sock < 0) {
+        print("[SMTP] Failed to create socket");
+        return false;
+    }
+
+    let conn: i32 = net_connect(sock, a, b, c, d, port);
+    if (conn < 0) {
+        print("[SMTP] Failed to connect to " + host + ":" + int_to_str(port));
+        net_close(sock);
+        return false;
+    }
+
+    // Read server greeting
+    let greeting: str = smtp_read_response(sock);
+    if (smtp_response_code(greeting) != 220) {
+        print("[SMTP] Bad greeting: " + greeting);
+        net_close(sock);
+        return false;
+    }
+
+    // EHLO
+    smtp_send_line(sock, "EHLO localhost");
+    let ehlo_resp: str = smtp_read_response(sock);
+    if (smtp_response_code(ehlo_resp) != 250) {
+        print("[SMTP] EHLO failed: " + ehlo_resp);
+        net_close(sock);
+        return false;
+    }
+
+    // AUTH LOGIN (if credentials provided)
+    if (len(username) > 0) {
+        smtp_send_line(sock, "AUTH LOGIN");
+        let auth_resp: str = smtp_read_response(sock);
+        if (smtp_response_code(auth_resp) != 334) {
+            print("[SMTP] AUTH LOGIN not supported: " + auth_resp);
+            net_close(sock);
+            return false;
+        }
+
+        smtp_send_line(sock, base64_encode(username));
+        let user_resp: str = smtp_read_response(sock);
+        if (smtp_response_code(user_resp) != 334) {
+            print("[SMTP] AUTH username rejected: " + user_resp);
+            net_close(sock);
+            return false;
+        }
+
+        smtp_send_line(sock, base64_encode(password));
+        let pass_resp: str = smtp_read_response(sock);
+        if (smtp_response_code(pass_resp) != 235) {
+            print("[SMTP] AUTH failed: " + pass_resp);
+            net_close(sock);
+            return false;
+        }
+    }
+
+    // MAIL FROM
+    smtp_send_line(sock, "MAIL FROM:<" + from_email + ">");
+    let from_resp: str = smtp_read_response(sock);
+    if (smtp_response_code(from_resp) != 250) {
+        print("[SMTP] MAIL FROM failed: " + from_resp);
+        net_close(sock);
+        return false;
+    }
+
+    // RCPT TO
+    smtp_send_line(sock, "RCPT TO:<" + to_email + ">");
+    let rcpt_resp: str = smtp_read_response(sock);
+    if (smtp_response_code(rcpt_resp) != 250) {
+        print("[SMTP] RCPT TO failed: " + rcpt_resp);
+        net_close(sock);
+        return false;
+    }
+
+    // DATA
+    smtp_send_line(sock, "DATA");
+    let data_resp: str = smtp_read_response(sock);
+    if (smtp_response_code(data_resp) != 354) {
+        print("[SMTP] DATA failed: " + data_resp);
+        net_close(sock);
+        return false;
+    }
+
+    // Send email headers and body
+    let message: str = "From: " + from_email + "\r\n";
+    message = message + "To: " + to_email + "\r\n";
+    message = message + "Subject: " + subject + "\r\n";
+    message = message + "MIME-Version: 1.0\r\n";
+    message = message + "Content-Type: text/html; charset=UTF-8\r\n";
+    message = message + "\r\n";
+    message = message + body + "\r\n";
+    message = message + ".\r\n";
+    net_write_str(sock, message);
+
+    let send_resp: str = smtp_read_response(sock);
+    if (smtp_response_code(send_resp) != 250) {
+        print("[SMTP] Send failed: " + send_resp);
+        net_close(sock);
+        return false;
+    }
+
+    // QUIT
+    smtp_send_line(sock, "QUIT");
+    net_close(sock);
+    return true;
+}
